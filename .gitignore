@@ -17,3 +17,6 @@
 # Environment Variables
 *.env
 pw.txt
+
+# macOS
+.DS_Store

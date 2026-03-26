@@ -12,6 +12,7 @@ import (
 
 	"github.com/gorilla/sessions"
 	"github.com/joho/godotenv"
+	"github.com/workos/workos-go/v3/pkg/directorysync"
 	"github.com/workos/workos-go/v3/pkg/sso"
 )
 
@@ -34,6 +35,7 @@ var conf struct {
 	RedirectURI string
 	Connection  string
 	Provider    string
+	DirectoryID string
 }
 
 func loadEnvVariables() {
@@ -49,15 +51,53 @@ func loadEnvVariables() {
 	flag.StringVar(&conf.RedirectURI, "redirect-uri", os.Getenv("WORKOS_REDIRECT_URI"), "The redirect uri.")
 	flag.StringVar(&conf.Connection, "connection", os.Getenv("WORKOS_CONNECTION"), "Use the Connection ID associated with your SSO Connection.")
 	flag.StringVar(&conf.Provider, "provider", "", "The OAuth provider used for the SSO connection.")
+	flag.StringVar(&conf.DirectoryID, "directory-id", os.Getenv("WORKOS_DIRECTORY_ID"), "Use the Directory ID associated with your Directory Sync connection.")
 	flag.Parse()
 
 	log.Printf("launching sso demo with configuration: %+v", conf)
 
 	sso.Configure(conf.APIKey, conf.ClientID)
+	directorysync.SetAPIKey(conf.APIKey)
 }
 
 func init() {
 	loadEnvVariables()
+}
+
+func directoryUsers(w http.ResponseWriter, r *http.Request) {
+	session, _ := store.Get(r, "cookie-name")
+	if auth, ok := session.Values["authenticated"].(bool); !ok || !auth {
+		http.Redirect(w, r, "/signin", http.StatusSeeOther)
+		return
+	}
+
+	tmpl := template.Must(template.ParseFiles("./static/directory_users.html"))
+
+	list, err := directorysync.ListUsers(
+		context.Background(),
+		directorysync.ListUsersOpts{
+			Directory: conf.DirectoryID,
+		},
+	)
+	if err != nil {
+		log.Printf("get users failed: %s", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	data := struct {
+		FirstName string
+		LastName  string
+		Users     interface{}
+	}{
+		FirstName: session.Values["first_name"].(string),
+		LastName:  session.Values["last_name"].(string),
+		Users:     list.Data,
+	}
+
+	if err := tmpl.Execute(w, data); err != nil {
+		log.Panic(err)
+	}
 }
 
 func signin(w http.ResponseWriter, r *http.Request) {
@@ -174,6 +214,7 @@ func main() {
 	router.HandleFunc("/login", login)
 	router.HandleFunc("/callback", callback)
 	router.HandleFunc("/logged_in", loggedin)
+	router.HandleFunc("/directory-users", directoryUsers)
 	router.HandleFunc("/", signin)
 	router.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
 	router.Handle("/signin/", http.StripPrefix("/signin/", http.FileServer(http.Dir("static"))))
