@@ -13,7 +13,7 @@ import (
 	"github.com/gorilla/sessions"
 	"github.com/joho/godotenv"
 	"github.com/workos/workos-go/v3/pkg/directorysync"
-	"github.com/workos/workos-go/v3/pkg/sso"
+	"github.com/workos/workos-go/v3/pkg/usermanagement"
 )
 
 var (
@@ -44,7 +44,6 @@ func loadEnvVariables() {
 		log.Fatal("Error loading .env file")
 	}
 
-	// Assign the environment variables to the `conf` struct fields
 	flag.StringVar(&conf.Addr, "addr", ":8000", "The server addr.")
 	flag.StringVar(&conf.APIKey, "api-key", os.Getenv("WORKOS_API_KEY"), "The WorkOS API key.")
 	flag.StringVar(&conf.ClientID, "client-id", os.Getenv("WORKOS_CLIENT_ID"), "The WorkOS client id.")
@@ -54,9 +53,9 @@ func loadEnvVariables() {
 	flag.StringVar(&conf.DirectoryID, "directory-id", os.Getenv("WORKOS_DIRECTORY_ID"), "Use the Directory ID associated with your Directory Sync connection.")
 	flag.Parse()
 
-	log.Printf("launching sso demo with configuration: %+v", conf)
+	log.Printf("launching DSE demo with configuration: %+v", conf)
 
-	sso.Configure(conf.APIKey, conf.ClientID)
+	usermanagement.SetAPIKey(conf.APIKey)
 	directorysync.SetAPIKey(conf.APIKey)
 }
 
@@ -106,17 +105,20 @@ func signin(w http.ResponseWriter, r *http.Request) {
 		log.Println(err)
 	}
 
-	if auth, ok := session.Values["authenticated"].(bool); !ok || !auth {
-		http.Redirect(w, r, "/signin", http.StatusSeeOther)
+	if auth, ok := session.Values["authenticated"].(bool); ok && auth {
+		http.Redirect(w, r, "/logged_in", http.StatusSeeOther)
 		return
 	}
 
-	http.Redirect(w, r, "/logged_in", http.StatusSeeOther)
+	http.Redirect(w, r, "/signin/", http.StatusSeeOther)
 }
 
 func logout(w http.ResponseWriter, r *http.Request) {
 	session, _ := store.Get(r, "cookie-name")
 	session.Values["authenticated"] = false
+	session.Values["first_name"] = ""
+	session.Values["last_name"] = ""
+	session.Values["raw_profile"] = ""
 
 	if err := session.Save(r, w); err != nil {
 		log.Panic(err)
@@ -126,17 +128,13 @@ func logout(w http.ResponseWriter, r *http.Request) {
 }
 
 func getAuthorizationURL(loginType string) (*url.URL, error) {
-	opts := sso.GetAuthorizationURLOpts{
+	opts := usermanagement.GetAuthorizationURLOpts{
+		ClientID:    conf.ClientID,
 		RedirectURI: conf.RedirectURI,
+		ConnectionID: conf.Connection,
+		Provider: "authkit",
 	}
-
-	if loginType == "saml" {
-		opts.Connection = conf.Connection
-	} else {
-		opts.Provider = sso.ConnectionType(loginType)
-	}
-
-	return sso.GetAuthorizationURL(opts)
+	return usermanagement.GetAuthorizationURL(opts)
 }
 
 func login(w http.ResponseWriter, r *http.Request) {
@@ -146,43 +144,62 @@ func login(w http.ResponseWriter, r *http.Request) {
 
 	loginType := r.Form.Get("login_method")
 
-	url, err := getAuthorizationURL(loginType)
+	authURL, err := getAuthorizationURL(loginType)
 	if err != nil {
 		log.Println(err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
-	http.Redirect(w, r, url.String(), http.StatusSeeOther)
+	http.Redirect(w, r, authURL.String(), http.StatusSeeOther)
 }
 
 func callback(w http.ResponseWriter, r *http.Request) {
 	tmpl := template.Must(template.ParseFiles("./static/logged_in.html"))
 	log.Printf("callback is called with %s", r.URL)
 
-	profile, err := sso.GetProfileAndToken(context.Background(), sso.GetProfileAndTokenOpts{
-		Code: r.URL.Query().Get("code"),
-	})
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		http.Error(w, "Missing code", http.StatusBadRequest)
+		return
+	}
+
+	authResp, err := usermanagement.AuthenticateWithCode(
+		context.Background(),
+		usermanagement.AuthenticateWithCodeOpts{
+			ClientID:  conf.ClientID,
+			Code:      code,
+			IPAddress: r.RemoteAddr,
+			UserAgent: r.UserAgent(),
+		},
+	)
 	if err != nil {
-		log.Printf("get profile failed: %s", err)
+		log.Printf("authenticate with code failed: %s", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	userJSON, err := json.MarshalIndent(authResp, "", "    ")
+	if err != nil {
+		log.Printf("marshal auth response failed: %s", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
 	session, _ := store.Get(r, "cookie-name")
 	session.Values["authenticated"] = true
-	session.Values["first_name"] = profile.Profile.FirstName
-	session.Values["last_name"] = profile.Profile.LastName
-	session.Values["raw_profile"], _ = json.MarshalIndent(profile, "", "    ")
+	session.Values["first_name"] = authResp.User.FirstName
+	session.Values["last_name"] = authResp.User.LastName
+	session.Values["raw_profile"] = userJSON
 
 	if err := session.Save(r, w); err != nil {
 		log.Panic(err)
 	}
 
 	thisProfile := Profile{
-		session.Values["first_name"].(string),
-		session.Values["last_name"].(string),
-		string(session.Values["raw_profile"].([]byte)),
+		First_name:  authResp.User.FirstName,
+		Last_name:   authResp.User.LastName,
+		Raw_profile: string(userJSON),
 	}
 
 	if err := tmpl.Execute(w, thisProfile); err != nil {
@@ -195,9 +212,9 @@ func loggedin(w http.ResponseWriter, r *http.Request) {
 	session, _ := store.Get(r, "cookie-name")
 
 	thisProfile := Profile{
-		session.Values["first_name"].(string),
-		session.Values["last_name"].(string),
-		string(session.Values["raw_profile"].([]byte)),
+		First_name:  session.Values["first_name"].(string),
+		Last_name:   session.Values["last_name"].(string),
+		Raw_profile: string(session.Values["raw_profile"].([]byte)),
 	}
 
 	if err := tmpl.Execute(w, thisProfile); err != nil {
@@ -221,6 +238,6 @@ func main() {
 	router.HandleFunc("/logout", logout)
 
 	if err := http.ListenAndServe(conf.Addr, router); err != nil {
-		log.Fatal("Error loading .env file: ", err)
+		log.Fatal("Error starting server: ", err)
 	}
 }
